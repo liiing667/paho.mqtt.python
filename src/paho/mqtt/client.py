@@ -44,6 +44,12 @@ from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, Mess
 from .matcher import MQTTMatcher
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
+from .session import (
+    SESSION_STATE_PUBLISH,
+    SESSION_STATE_PUBREL,
+    SessionMessage,
+    SessionStore,
+)
 from .subscribeoptions import SubscribeOptions
 
 try:
@@ -709,6 +715,15 @@ class Client:
         if applications fails while processing a message, or while it pending
         locally.
 
+    :param SessionStore session_store: an optional object implementing the
+        `paho.mqtt.session.SessionStore` interface (`load`, `save`, `remove`,
+        `clear`). When provided, the client persists in-flight QoS 1 and QoS 2
+        outgoing messages so that they survive a process restart. On
+        (re)connect with a non-clean session, stored records are loaded and
+        resent with their original message id; on a clean session start the
+        stored records are discarded. When None (the default), the session is
+        kept in memory only, as before.
+
     Callbacks
     =========
 
@@ -755,6 +770,7 @@ class Client:
         transport: Literal["tcp", "websockets", "unix"] = "tcp",
         reconnect_on_failure: bool = True,
         manual_ack: bool = False,
+        session_store: SessionStore | None = None,
     ) -> None:
         transport = transport.lower()  # type: ignore
         if transport == "unix" and not hasattr(socket, "AF_UNIX"):
@@ -770,6 +786,12 @@ class Client:
         self._sock: SocketLike | None = None
         self._sockpairR: socket.socket | None = None
         self._sockpairW: socket.socket | None = None
+        if session_store is not None:
+            for method in ("load", "save", "remove", "clear"):
+                if not callable(getattr(session_store, method, None)):
+                    raise ValueError(
+                        f"session_store must define a callable {method}() method")
+        self._session_store = session_store
         self._keepalive = 60
         self._connect_timeout = 5.0
         self._client_mode = MQTT_CLIENT
@@ -1596,6 +1618,10 @@ class Client:
             self._last_msg_out = time_func()
 
         # Put messages in progress in a valid state.
+        if self._check_clean_session():
+            self._session_store_clear()
+        else:
+            self._session_store_load()
         self._messages_reconnect_reset()
 
         with self._callback_mutex:
@@ -3476,7 +3502,15 @@ class Client:
 
         packet.extend(payload)
 
-        return self._packet_queue(PUBLISH, packet, mid, qos, info)
+        rc = self._packet_queue(PUBLISH, packet, mid, qos, info)
+        if rc == MQTTErrorCode.MQTT_ERR_SUCCESS and qos > 0 and self._session_store is not None:
+            # Persist the in-flight message now that it has been sent, before
+            # its acknowledgement (PUBACK/PUBREC/PUBCOMP) can arrive.
+            with self._out_message_mutex:
+                message = self._out_messages.get(mid)
+            if message is not None:
+                self._session_store_save(message)
+        return rc
 
     def _send_pubrec(self, mid: int) -> MQTTErrorCode:
         self._easy_log(MQTT_LOG_DEBUG, "Sending PUBREC (Mid: %d)", mid)
@@ -3788,6 +3822,96 @@ class Client:
         self._messages_reconnect_reset_out()
         self._messages_reconnect_reset_in()
 
+    def _session_store_error(self, operation: str, err: Exception) -> None:
+        # A failing store must not take down the network thread: log the
+        # error and report it through the usual disconnect path so the
+        # application is notified via on_disconnect.
+        self._easy_log(
+            MQTT_LOG_ERR, "Session store %s failed: %s", operation, err)
+        self._sock_close()
+        self._do_on_disconnect(
+            packet_from_broker=False,
+            v1_rc=MQTTErrorCode.MQTT_ERR_CONN_LOST,
+        )
+
+    def _session_store_save(self, message: MQTTMessage) -> None:
+        store = self._session_store
+        if store is None or message.qos == 0:
+            return
+        if message.state == mqtt_ms_wait_for_pubcomp:
+            state = SESSION_STATE_PUBREL
+        else:
+            state = SESSION_STATE_PUBLISH
+        record = SessionMessage(
+            client_id=self._client_id.decode("utf-8", "replace"),
+            mid=message.mid,
+            topic=message._topic,
+            payload=bytes(message.payload),
+            qos=message.qos,
+            retain=message.retain,
+            dup=message.dup,
+            state=state,
+        )
+        try:
+            store.save(record)
+        except Exception as err:
+            self._session_store_error("save", err)
+
+    def _session_store_remove(self, mid: int) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.remove(mid)
+        except Exception as err:
+            self._session_store_error("remove", err)
+
+    def _session_store_clear(self) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            store.clear(self._client_id.decode("utf-8", "replace"))
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Session store clear failed: %s", err)
+
+    def _session_store_load(self) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        try:
+            records = store.load(self._client_id.decode("utf-8", "replace"))
+        except Exception as err:
+            self._easy_log(
+                MQTT_LOG_ERR, "Session store load failed: %s", err)
+            return
+        if not records:
+            return
+        max_mid = 0
+        with self._out_message_mutex:
+            for record in records:
+                if record.mid in self._out_messages:
+                    # Already tracked in memory, the in-memory state is newer.
+                    continue
+                message = MQTTMessage(record.mid, _force_bytes(record.topic))
+                message.timestamp = 0
+                message.payload = _force_bytes(record.payload)
+                message.qos = record.qos
+                message.retain = record.retain
+                message.dup = record.dup
+                if record.qos == 2 and record.state == SESSION_STATE_PUBREL:
+                    message.state = mqtt_ms_wait_for_pubcomp
+                elif record.qos == 2:
+                    message.state = mqtt_ms_wait_for_pubrec
+                else:
+                    message.state = mqtt_ms_wait_for_puback
+                self._out_messages[record.mid] = message
+                max_mid = max(max_mid, record.mid)
+        # Avoid reusing a mid that a restored message still owns.
+        if max_mid > self._last_mid:
+            self._last_mid = max_mid
+
     def _packet_queue(
         self,
         command: int,
@@ -4069,6 +4193,8 @@ class Client:
         with self._out_message_mutex:
             retval = list(self._out_messages.values())
             self._out_messages.clear()
+        for message in retval:
+            self._session_store_remove(message.mid)
         return retval
 
     def _handle_disconnect(self) -> None:
@@ -4329,6 +4455,7 @@ class Client:
                 msg = self._out_messages[mid]
                 msg.state = mqtt_ms_wait_for_pubcomp
                 msg.timestamp = time_func()
+                self._session_store_save(msg)
                 return self._send_pubrel(mid)
 
         return MQTTErrorCode.MQTT_ERR_SUCCESS
@@ -4480,6 +4607,7 @@ class Client:
                         raise
 
         msg = self._out_messages.pop(mid)
+        self._session_store_remove(mid)
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1

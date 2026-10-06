@@ -84,6 +84,12 @@ When ``clean_session`` is False, the session is only stored in memory and not pe
 when the client is restarted (not just reconnected, the object is recreated usually because the
 program was restarted) the session is lost. This results in a possible message loss.
 
+This can be mitigated by passing a ``session_store`` to ``Client``: any object implementing
+``load(client_id)``, ``save(record)``, ``remove(mid)`` and ``clear(client_id)`` (see
+``paho.mqtt.session.SessionStore``). The client then persists in-flight QoS 1 and QoS 2 outgoing
+messages and reloads them on reconnect with a non-clean session, resending them with their
+original message id.
+
 The following part of the client session is lost:
 
 * QoS 2 messages which have been received from the server, but have not been completely acknowledged.
